@@ -6,6 +6,7 @@ public class BatchingProcessor  : BackgroundService
     private readonly IServiceScopeFactory scopeFactory;
     private readonly ConcurrentDictionary<int, int> stockUpdates;
     private readonly ILogger<BatchingProcessor> logger;
+    private readonly SemaphoreSlim semaphore = new(1, 1);
     private readonly TimeSpan updateInterval = TimeSpan.FromSeconds(1);
 
     public BatchingProcessor(IServiceScopeFactory scopeFactory, ILogger<BatchingProcessor> logger)
@@ -18,8 +19,9 @@ public class BatchingProcessor  : BackgroundService
     // Método para añadir o actualizar una entrada de stock en la cola
     public void EnqueueStockUpdate(int productId, int newAmount)
     {
-        logger.LogWarning("Enqueued update for Product ID {ProductId} with new amount {Amount}.", productId, newAmount);
+        logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} - Enqueued update for Product ID {productId} with new amount {newAmount}.");
         stockUpdates[productId] = newAmount; // Añade o reemplaza la cantidad existente para el producto
+
     }
 
 
@@ -30,7 +32,8 @@ public class BatchingProcessor  : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-          logger.LogInformation("🔄 Waiting for the next batch update cycle...");
+          logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} - Waiting for stock updates...");
+          // logger.LogInformation("🔄 Waiting for the next batch update cycle...");
           await Task.Delay(updateInterval, stoppingToken);
           await ExecutePendingUpdatesAsync(warehouseStockSystem);
         }
@@ -39,23 +42,37 @@ public class BatchingProcessor  : BackgroundService
     // Método para procesar las actualizaciones pendientes de stock
     private async Task ExecutePendingUpdatesAsync(IWarehouseStockSystemClient warehouseStockSystem)
     {
-      logger.LogInformation("🔄 Processing stock updates...");
+
+      await semaphore.WaitAsync();
       try
       {
-          foreach (var update in stockUpdates.ToList())
+        if (stockUpdates.IsEmpty)
+        {
+            logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} -🟢 No stock updates to process.");
+            return;
+        }
+
+        logger.LogInformation(" ⚙️ Processing stock updates...");
+        foreach(var update in stockUpdates.ToList())
+        {
+          if (stockUpdates.TryRemove(update.Key, out var amount))
           {
-              if (stockUpdates.TryRemove(update.Key, out var amount))
-              {
-                  logger.LogInformation("📤 Updating product ID {ProductId} to new amount {Amount}.", update.Key, amount);
-                  await warehouseStockSystem.UpdateStock(update.Key, amount);
-                  logger.LogInformation("✅ Successfully updated product ID {ProductId} to new amount {Amount}.", update.Key, amount);
-              }
+              logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} - 📤 Updating product ID {update.Key} to new amount {amount}.");
+              await warehouseStockSystem.UpdateStock(update.Key, amount);
+              logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} - Successfully updated product ID {update.Key} to new amount {amount}.");
+
           }
+
+        }
       }
       catch (Exception ex)
       {
-        logger.LogError(ex, "⚠️ Error processing stock updates");
+        logger.LogError(ex, $"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} -⚠️ Error processing stock updates");
       }
-      logger.LogInformation("🔄 Finished processing stock updates.");
+      finally
+      {
+        semaphore.Release();
+      }
+      logger.LogInformation($"🔚 Finished processing stock updates.");
     }
 }
