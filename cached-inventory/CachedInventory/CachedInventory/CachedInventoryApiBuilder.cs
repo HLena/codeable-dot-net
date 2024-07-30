@@ -1,11 +1,12 @@
 namespace CachedInventory;
 
+using System.Collections.Concurrent;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Caching.Memory;
 
 public static class CachedInventoryApiBuilder
 {
-  // private static readonly ConcurrentDictionary<int, int> StockUpdates = new();
+  private static readonly SemaphoreSlim semaphore = new(1, 1);
   public static WebApplication Build(string[] args)
   {
     var builder = WebApplication.CreateBuilder(args);
@@ -19,13 +20,12 @@ public static class CachedInventoryApiBuilder
     builder.Services.AddSwaggerGen();
     builder.Services.AddMemoryCache();
     builder.Services.AddSingleton<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
-    // builder.Services.AddScoped<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
-    // builder.Services.AddSingleton<InventoryService>();
     builder.Services.AddSingleton<BatchingProcessor>();
     builder.Services.AddHostedService(provider => provider.GetRequiredService<BatchingProcessor>());
 
     var app = builder.Build();
-    var cache = app.Services.GetRequiredService<IMemoryCache>();
+    // var cache = app.Services.GetRequiredService<IMemoryCache>();
+    var cache = new ConcurrentDictionary<int, int>();
     var logger = app.Services.GetRequiredService<ILogger<BatchingProcessor>>();
     var BatchingProcessor = app.Services.GetRequiredService<BatchingProcessor>();
 
@@ -52,17 +52,27 @@ public static class CachedInventoryApiBuilder
         "/stock/retrieve",
         async ( [FromServices] IWarehouseStockSystemClient client, [FromBody] RetrieveStockRequest req,[FromServices] ILogger<BatchingProcessor> logger) =>
         {
-          var stock = await GetStockFromCacheOrSource(cache, client,logger, req.ProductId);
-
-          if (stock < req.Amount)
+          await semaphore.WaitAsync();
+          try
           {
-            logger.LogInformation("❌ Not enough stock for product ID {ProductId}. Requested amount: {Amount}, Available stock: {Stock}", req.ProductId, req.Amount, stock);
-            return Results.BadRequest("Not enough stock.");
+            var stock = await GetStockFromCacheOrSource(cache, client,logger, req.ProductId);
+
+            if (stock < req.Amount)
+            {
+              logger.LogInformation("❌ Not enough stock for product ID {ProductId}. Requested amount: {Amount}, Available stock: {Stock}", req.ProductId, req.Amount, stock);
+              return Results.BadRequest("Not enough stock.");
+            }
+            var newStock = stock - req.Amount;
+            cache[req.ProductId] =  newStock;
+            // cache.Set(req.ProductId, newStock);
+            logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} - 📦 Retrieve stock for product ID {req.ProductId}. Amount: {req.Amount}, New stock: {newStock}, currentStock:{stock}");
+            BatchingProcessor.EnqueueStockUpdate(req.ProductId, stock - req.Amount);
+            return Results.Ok();
           }
-          cache.Set(req.ProductId, stock - req.Amount);
-          BatchingProcessor.EnqueueStockUpdate(req.ProductId, stock - req.Amount);
-          logger.LogInformation("📦 Retrieve stock for product ID {ProductId}. Amount: {Amount}, New stock: {NewStock}", req.ProductId, req.Amount, stock - req.Amount);
-          return Results.Ok();
+          finally
+          {
+            semaphore.Release();
+          }
         })
       .WithName("RetrieveStock")
       .WithOpenApi();
@@ -73,11 +83,13 @@ public static class CachedInventoryApiBuilder
         async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RestockRequest req, [FromServices] ILogger<BatchingProcessor> logger) =>
         {
           var stock = await GetStockFromCacheOrSource(cache, client,logger, req.ProductId);
+          var newStock = stock + req.Amount;
+          cache[req.ProductId] = newStock;
+          // cache.Set(req.ProductId, newStock);
 
-          cache.Set(req.ProductId, stock + req.Amount);
+          logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} - 📦 Restock for product ID {req.ProductId}. Amount: {req.Amount}, New stock: {newStock}, currentStock:{stock}");
           BatchingProcessor.EnqueueStockUpdate(req.ProductId, stock + req.Amount);
 
-          logger.LogInformation("📦 Restock for product ID {ProductId}. Amount: {Amount}, New stock: {NewStock}", req.ProductId, req.Amount, req.Amount + stock);
 
           return Results.Ok();
         })
@@ -87,20 +99,23 @@ public static class CachedInventoryApiBuilder
     return app;
   }
 
-  private static async Task<int> GetStockFromCacheOrSource(IMemoryCache cache, IWarehouseStockSystemClient client, ILogger logger, int productId)
+  // private static async Task<int> GetStockFromCacheOrSource(IMemoryCache cache, IWarehouseStockSystemClient client, ILogger logger, int productId)
+  private static async Task<int> GetStockFromCacheOrSource(ConcurrentDictionary<int, int> cache, IWarehouseStockSystemClient client, ILogger logger, int productId)
   {
-    if (!cache.TryGetValue(productId, out int cachedStock))
-    {
-        cachedStock = await client.GetStock(productId);
-        cache.Set(productId, cachedStock);
-        logger.LogInformation("📦 Cache miss for product ID {ProductId}. Fetched from source: {Stock}", productId, cachedStock);
-    }
-    else
-    {
-        logger.LogInformation("📦 Cache hit for product ID {ProductId}: {Stock}", productId, cachedStock);
-    }
 
-    return cachedStock;
+      if (!cache.TryGetValue(productId, out var cachedStock))
+      {
+          cachedStock = await client.GetStock(productId);
+          // cache.Set(productId, cachedStock);
+          cache[productId] = cachedStock;
+          logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} - 📦 Cache miss for product ID {productId}. Fetched from source: {cachedStock}", productId, cachedStock);
+      }
+      else
+      {
+          logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} - 📦 Cache hit for product ID {productId}: {cachedStock}");
+      }
+      return cachedStock;
+
   }
 
 }
