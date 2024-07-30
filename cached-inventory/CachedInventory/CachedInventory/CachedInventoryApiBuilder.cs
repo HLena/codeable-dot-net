@@ -6,7 +6,7 @@ using Microsoft.Extensions.Caching.Memory;
 
 public static class CachedInventoryApiBuilder
 {
-  private static readonly SemaphoreSlim semaphore = new(1, 1);
+  private static readonly SemaphoreSlim Semaphore = new(1, 1);
   public static WebApplication Build(string[] args)
   {
     var builder = WebApplication.CreateBuilder(args);
@@ -14,22 +14,19 @@ public static class CachedInventoryApiBuilder
     builder.Logging.ClearProviders();
     builder.Logging.AddConsole();
     builder.Logging.AddDebug();
-    // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
-    // Add services to the container.
+
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddSwaggerGen();
     builder.Services.AddMemoryCache();
     builder.Services.AddSingleton<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
-    builder.Services.AddSingleton<BatchingProcessor>();
-    builder.Services.AddHostedService(provider => provider.GetRequiredService<BatchingProcessor>());
+    builder.Services.AddSingleton<StockUpdateScheduler>();
+    builder.Services.AddHostedService(provider => provider.GetRequiredService<StockUpdateScheduler>());
 
     var app = builder.Build();
-    // var cache = app.Services.GetRequiredService<IMemoryCache>();
-    var cache = new ConcurrentDictionary<int, int>();
-    var logger = app.Services.GetRequiredService<ILogger<BatchingProcessor>>();
-    var BatchingProcessor = app.Services.GetRequiredService<BatchingProcessor>();
+    var cache = app.Services.GetRequiredService<IMemoryCache>();
+    var logger = app.Services.GetRequiredService<ILogger<StockUpdateScheduler>>();
+    var BatchingProcessor = app.Services.GetRequiredService<StockUpdateScheduler>();
 
-    // Configure the HTTP request pipeline.
     if (app.Environment.IsDevelopment())
     {
       app.UseSwagger();
@@ -50,9 +47,9 @@ public static class CachedInventoryApiBuilder
 
     app.MapPost(
         "/stock/retrieve",
-        async ( [FromServices] IWarehouseStockSystemClient client, [FromBody] RetrieveStockRequest req,[FromServices] ILogger<BatchingProcessor> logger) =>
+        async ( [FromServices] IWarehouseStockSystemClient client, [FromBody] RetrieveStockRequest req,[FromServices] ILogger<StockUpdateScheduler> logger) =>
         {
-          await semaphore.WaitAsync();
+          await Semaphore.WaitAsync();
           try
           {
             var stock = await GetStockFromCacheOrSource(cache, client,logger, req.ProductId);
@@ -63,15 +60,14 @@ public static class CachedInventoryApiBuilder
               return Results.BadRequest("Not enough stock.");
             }
             var newStock = stock - req.Amount;
-            cache[req.ProductId] =  newStock;
-            // cache.Set(req.ProductId, newStock);
+            cache.Set(req.ProductId, newStock);
             logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} - 📦 Retrieve stock for product ID {req.ProductId}. Amount: {req.Amount}, New stock: {newStock}, currentStock:{stock}");
             BatchingProcessor.EnqueueStockUpdate(req.ProductId, stock - req.Amount);
             return Results.Ok();
           }
           finally
           {
-            semaphore.Release();
+            Semaphore.Release();
           }
         })
       .WithName("RetrieveStock")
@@ -80,12 +76,11 @@ public static class CachedInventoryApiBuilder
 
     app.MapPost(
         "/stock/restock",
-        async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RestockRequest req, [FromServices] ILogger<BatchingProcessor> logger) =>
+        async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RestockRequest req, [FromServices] ILogger<StockUpdateScheduler> logger) =>
         {
           var stock = await GetStockFromCacheOrSource(cache, client,logger, req.ProductId);
           var newStock = stock + req.Amount;
-          cache[req.ProductId] = newStock;
-          // cache.Set(req.ProductId, newStock);
+          cache.Set(req.ProductId, newStock);
 
           logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} - 📦 Restock for product ID {req.ProductId}. Amount: {req.Amount}, New stock: {newStock}, currentStock:{stock}");
           BatchingProcessor.EnqueueStockUpdate(req.ProductId, stock + req.Amount);
@@ -99,15 +94,13 @@ public static class CachedInventoryApiBuilder
     return app;
   }
 
-  // private static async Task<int> GetStockFromCacheOrSource(IMemoryCache cache, IWarehouseStockSystemClient client, ILogger logger, int productId)
-  private static async Task<int> GetStockFromCacheOrSource(ConcurrentDictionary<int, int> cache, IWarehouseStockSystemClient client, ILogger logger, int productId)
+  private static async Task<int> GetStockFromCacheOrSource(IMemoryCache cache, IWarehouseStockSystemClient client, ILogger logger, int productId)
   {
 
-      if (!cache.TryGetValue(productId, out var cachedStock))
+      if (!cache.TryGetValue(productId, out int cachedStock))
       {
           cachedStock = await client.GetStock(productId);
-          // cache.Set(productId, cachedStock);
-          cache[productId] = cachedStock;
+          cache.Set(productId, cachedStock);
           logger.LogInformation($"🌐 Thread ID: {Thread.CurrentThread.ManagedThreadId} - 📦 Cache miss for product ID {productId}. Fetched from source: {cachedStock}", productId, cachedStock);
       }
       else
