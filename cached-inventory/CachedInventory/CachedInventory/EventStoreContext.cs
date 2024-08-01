@@ -1,5 +1,7 @@
 
 namespace CachedInventory;
+
+using System.ComponentModel.DataAnnotations;
 using Microsoft.EntityFrameworkCore;
 
 // Add a reference to the Microsoft.EntityFrameworkCore assembly
@@ -14,8 +16,12 @@ public class EventStoreContext: DbContext
 public class Event
 {
     public int Id { get; set; }
-    public string Type { get; set; }
-    public string Data { get; set; }
+    public int ProductId { get; set; }
+
+    [AllowedValues("restock", "retrieve")]
+    public required string Type { get; set; }
+    
+    public int Quantity { get; set; }
     public DateTime Timestamp { get; set; }
 }
 
