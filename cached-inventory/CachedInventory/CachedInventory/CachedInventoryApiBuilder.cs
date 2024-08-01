@@ -15,8 +15,10 @@ public static class CachedInventoryApiBuilder
 
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddSwaggerGen();
-    builder.Services.AddDbContext<EventStoreContext>(options =>
-      options.UseSqlServer(builder.Configuration.GetConnectionString("EventStore")));
+    builder.Services.AddDbContext<EventStoreContext>(
+      options =>
+        options.UseSqlServer("name=DefaultConnection")
+    );
     builder.Services.AddSingleton<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
 
     var app = builder.Build();
