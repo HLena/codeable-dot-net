@@ -1,8 +1,7 @@
 namespace CachedInventory;
 
-using System.Collections.Concurrent;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Caching.Memory;
+using Microsoft.EntityFrameworkCore;
 
 public static class CachedInventoryApiBuilder
 {
@@ -16,6 +15,8 @@ public static class CachedInventoryApiBuilder
 
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddSwaggerGen();
+    builder.Services.AddDbContext<EventStoreContext>(options =>
+      options.UseSqlServer(builder.Configuration.GetConnectionString("EventStore")));
     builder.Services.AddSingleton<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
 
     var app = builder.Build();
