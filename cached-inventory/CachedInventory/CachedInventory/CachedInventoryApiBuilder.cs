@@ -34,22 +34,37 @@ public static class CachedInventoryApiBuilder
 
     app.MapGet(
         "/stock/{productId:int}",
-        async ([FromServices] IWarehouseStockSystemClient client, int productId) => await client.GetStock(productId))
+        async ([FromServices] IWarehouseStockSystemClient client, [FromServices] EventStoreContext context, int productId) =>
+        {
+          var stock = await GetStockFromEvents(context, productId);
+          return Results.Ok(stock);
+        })
       .WithName("GetStock")
       .WithOpenApi();
 
 
     app.MapPost(
       "/stock/retrieve",
-      async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RetrieveStockRequest req) =>
+      async ([FromServices] IWarehouseStockSystemClient client, [FromServices] EventStoreContext context, [FromBody] RetrieveStockRequest req) =>
       {
-        var stock = await client.GetStock(req.ProductId);
+        // var stock = await client.GetStock(req.ProductId);
+        var stock = await GetStockFromEvents(context, req.ProductId);
         if (stock < req.Amount)
         {
           return Results.BadRequest("Not enough stock.");
         }
 
-        await client.UpdateStock(req.ProductId, stock - req.Amount);
+        var newStock = stock - req.Amount;
+        var stockRetrieveEvent = new Event
+        {
+          ProductId = req.ProductId,
+          Type = "retrieve",
+          Quantity = req.Amount,
+          Timestamp = DateTime.UtcNow
+        };
+        await context.Events.AddAsync(stockRetrieveEvent);
+        await context.SaveChangesAsync();
+        // await client.UpdateStock(req.ProductId, stock - req.Amount);
         return Results.Ok();
       })
     .WithName("RetrieveStock")
@@ -58,10 +73,22 @@ public static class CachedInventoryApiBuilder
 
     app.MapPost(
           "/stock/restock",
-          async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RestockRequest req) =>
+          async ([FromServices] IWarehouseStockSystemClient client, [FromServices] EventStoreContext context, [FromBody] RestockRequest req) =>
           {
-            var stock = await client.GetStock(req.ProductId);
-            await client.UpdateStock(req.ProductId, req.Amount + stock);
+            // var stock = await client.GetStock(req.ProductId);
+            var stock = await GetStockFromEvents(context, req.ProductId);
+            var newStock = stock + req.Amount;
+            var stockRestockEvent = new Event
+            {
+              ProductId = req.ProductId,
+              Type = "restock",
+              Quantity = req.Amount,
+              Timestamp = DateTime.UtcNow
+            };
+
+            await context.Events.AddAsync(stockRestockEvent);
+            await context.SaveChangesAsync();
+            // await client.UpdateStock(req.ProductId, req.Amount + stock);
             return Results.Ok();
           })
         .WithName("Restock")
