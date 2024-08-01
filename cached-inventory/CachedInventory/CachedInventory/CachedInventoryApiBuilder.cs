@@ -1,5 +1,6 @@
 namespace CachedInventory;
 
+using System.Text.Json;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 
@@ -67,6 +68,29 @@ public static class CachedInventoryApiBuilder
         .WithOpenApi();
 
       return app;
+    }
+
+    private static async Task<int> GetStockFromEvents(EventStoreContext context, int productId)
+    {
+        var events = await context.Events
+            .Where(e => e.ProductId == productId)
+            .OrderBy(e => e.Timestamp)
+            .ToListAsync();
+
+        var stock = 0;
+
+        foreach (var e in events)
+        {
+            if (e.Type == "retrieve")
+            {
+                stock -= e.Quantity;
+            }
+            else if (e.Type == "restock")
+            {
+                stock += e.Quantity;
+            }
+        }
+        return stock;
     }
 }
 
