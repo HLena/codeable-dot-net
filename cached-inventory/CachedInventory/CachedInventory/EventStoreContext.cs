@@ -20,10 +20,8 @@ public class Event
 
     [AllowedValues("restock", "retrieve")]
     public required string Type { get; set; }
-    
+
     public int Quantity { get; set; }
     public DateTime Timestamp { get; set; }
 }
 
-public record StockRetrieved(int ProductId, int Amount);
-public record StockRestocked(int ProductId, int Amount);
