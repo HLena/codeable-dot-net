@@ -42,17 +42,44 @@ public static class CachedInventoryApiBuilder
       .WithName("GetStock")
       .WithOpenApi();
 
+    app.MapGet(
+        "/stock/validateOperation/{productId:int}",
+        async ([FromServices] IWarehouseStockSystemClient client, [FromServices] EventStoreContext context, int productId, int amount) =>
+        {
+          var stock = await GetStockFromEvents(context, productId);
+          var newStock = stock - amount;
+          if(newStock < 0)
+          {
+            return Results.BadRequest("Not enough stock.");
+          }
+          return Results.Ok();
+        })
+      .WithName("CalculateStock")
+      .WithOpenApi();
+
 
     app.MapPost(
       "/stock/retrieve",
       async ([FromServices] IWarehouseStockSystemClient client, [FromServices] EventStoreContext context, [FromBody] RetrieveStockRequest req) =>
       {
-        // var stock = await client.GetStock(req.ProductId);
-        var stock = await GetStockFromEvents(context, req.ProductId);
-        if (stock < req.Amount)
+        var events = await GetEvents(context, req.ProductId);
+        var stock = 0;
+        if(events.Count == 0)
         {
-          return Results.BadRequest("Not enough stock.");
+          stock = await client.GetStock(req.ProductId);
+          var stockRestockEvent = new Event
+          {
+            ProductId = req.ProductId,
+            Type = "restock",
+            Quantity = stock,
+            Timestamp = DateTime.UtcNow
+          };
+
+          await context.Events.AddAsync(stockRestockEvent);
+          await context.SaveChangesAsync();
         }
+        stock = await GetStockFromEvents(context, req.ProductId);
+
 
         var newStock = stock - req.Amount;
         var stockRetrieveEvent = new Event
@@ -65,10 +92,10 @@ public static class CachedInventoryApiBuilder
         await context.Events.AddAsync(stockRetrieveEvent);
         await context.SaveChangesAsync();
         // await client.UpdateStock(req.ProductId, stock - req.Amount);
-        return Results.Ok();
+        Results.Redirect($"/stock/validateOperation/{req.ProductId}?amount={req.Amount}");
       })
     .WithName("RetrieveStock")
-      .WithOpenApi();
+    .WithOpenApi();
 
 
     app.MapPost(
@@ -99,11 +126,7 @@ public static class CachedInventoryApiBuilder
 
     private static async Task<int> GetStockFromEvents(EventStoreContext context, int productId)
     {
-        var events = await context.Events
-            .Where(e => e.ProductId == productId)
-            .OrderBy(e => e.Timestamp)
-            .ToListAsync();
-
+        var events = await GetEvents(context, productId);
         var stock = 0;
 
         foreach (var e in events)
@@ -119,6 +142,13 @@ public static class CachedInventoryApiBuilder
         }
         return stock;
     }
+
+  private static async Task<List<Event>> GetEvents(EventStoreContext context, int productId) => await context.Events
+    .Where(e => e.ProductId == productId)
+    .OrderBy(e => e.Timestamp)
+    .ToListAsync();
+
+
 }
 
 public record RetrieveStockRequest(int ProductId, int Amount);
