@@ -17,10 +17,7 @@ public class Event
 {
     public int Id { get; set; }
     public int ProductId { get; set; }
-
-    [AllowedValues("restock", "retrieve")]
-    public required string Type { get; set; }
-
+    public bool IsRestock { get; set; }
     public int Quantity { get; set; }
     public DateTime Timestamp { get; set; }
 }
