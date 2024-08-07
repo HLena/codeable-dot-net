@@ -1,8 +1,10 @@
 namespace CachedInventory;
 
-using System.Text.Json;
+
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using System.Net.Http;
+using System.Net.Http.Json;
 
 public static class CachedInventoryApiBuilder
 {
@@ -22,6 +24,8 @@ public static class CachedInventoryApiBuilder
     );
     builder.Services.AddSingleton<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
 
+    builder.Services.AddHttpClient();
+
     var app = builder.Build();
 
     if (app.Environment.IsDevelopment())
@@ -32,67 +36,77 @@ public static class CachedInventoryApiBuilder
 
     app.UseHttpsRedirection();
 
-    app.MapGet(
+    _ = app.MapGet(
         "/stock/{productId:int}",
-        async ([FromServices] IWarehouseStockSystemClient client, [FromServices] EventStoreContext context, int productId) =>
+        static async ([FromServices] IWarehouseStockSystemClient client, [FromServices] EventStoreContext context, int productId) =>
         {
           var stock = await GetStockFromEvents(context, productId);
-          return Results.Ok(stock);
+          // return Results.Ok(stock);
+          return Results.Json(new { stock.Stock, stock.FailedRequests });
+
         })
       .WithName("GetStock")
       .WithOpenApi();
 
-    app.MapGet(
-        "/stock/validateOperation/{productId:int}",
-        async ([FromServices] IWarehouseStockSystemClient client, [FromServices] EventStoreContext context, int productId, int amount) =>
+    app.MapPost(
+        "/stock/validate-retrieve",
+        async ([FromServices] IWarehouseStockSystemClient client, [FromServices] EventStoreContext context, int productId, [FromBody] RetrieveStockRequest req) =>
         {
-          var stock = await GetStockFromEvents(context, productId);
-          var newStock = stock - amount;
-          if(newStock < 0)
+
+          var hasPreviousEvents = await context.Events.AnyAsync(e => e.ProductId == productId);
+          if(!hasPreviousEvents)
           {
-            return Results.BadRequest("Not enough stock.");
+              var initialStock = await client.GetStock(productId);
+              if(initialStock < req.Amount)
+              {
+                return Results.BadRequest("Not enough stock.");
+              }
           }
-          return Results.Ok();
+          else
+          {
+            var currentStock = await GetStockFromEvents(context, productId);
+            if(currentStock.Stock < req.Amount)
+            {
+              return Results.BadRequest("Not enough stock.");
+            }
+          }
+
+          return Results.Ok("Stock is available.");
         })
-      .WithName("CalculateStock")
+      .WithName("ValidateRetrieve")
       .WithOpenApi();
 
 
     app.MapPost(
       "/stock/retrieve",
-      async ([FromServices] IWarehouseStockSystemClient client, [FromServices] EventStoreContext context, [FromBody] RetrieveStockRequest req) =>
+      async ([FromServices] EventStoreContext context,[FromServices] IHttpClientFactory httpClientFactory, [FromBody] RetrieveStockRequest req) =>
       {
-        var events = await GetEvents(context, req.ProductId);
-        var stock = 0;
-        if(events.Count == 0)
+
+        var client = httpClientFactory.CreateClient();
+
+        var validationResponse = await client.PostAsJsonAsync("/stock/validate-retrieve", req);
+
+        if(!validationResponse.IsSuccessStatusCode)
         {
-          stock = await client.GetStock(req.ProductId);
-          var stockRestockEvent = new Event
-          {
-            ProductId = req.ProductId,
-            Type = "restock",
-            Quantity = stock,
-            Timestamp = DateTime.UtcNow
-          };
-
-          await context.Events.AddAsync(stockRestockEvent);
-          await context.SaveChangesAsync();
+          var error = await validationResponse.Content.ReadAsStringAsync();
+          return Results.BadRequest(error);
         }
-        stock = await GetStockFromEvents(context, req.ProductId);
 
+        var currentStock = await GetStockFromEvents(context, req.ProductId);
 
-        var newStock = stock - req.Amount;
-        var stockRetrieveEvent = new Event
+        var stockRemovalEvent = new Event
         {
           ProductId = req.ProductId,
-          Type = "retrieve",
+          IsRestock = false,
           Quantity = req.Amount,
           Timestamp = DateTime.UtcNow
         };
-        await context.Events.AddAsync(stockRetrieveEvent);
+
+        await context.Events.AddAsync(stockRemovalEvent);
         await context.SaveChangesAsync();
-        // await client.UpdateStock(req.ProductId, stock - req.Amount);
-        Results.Redirect($"/stock/validateOperation/{req.ProductId}?amount={req.Amount}");
+
+        return Results.Ok();
+        // Results.Redirect($"/stock/validateOperation/{req.ProductId}?amount={req.Amount}");
       })
     .WithName("RetrieveStock")
     .WithOpenApi();
@@ -102,20 +116,30 @@ public static class CachedInventoryApiBuilder
           "/stock/restock",
           async ([FromServices] IWarehouseStockSystemClient client, [FromServices] EventStoreContext context, [FromBody] RestockRequest req) =>
           {
-            // var stock = await client.GetStock(req.ProductId);
-            var stock = await GetStockFromEvents(context, req.ProductId);
-            var newStock = stock + req.Amount;
-            var stockRestockEvent = new Event
+            var hasPreviousEvents = await context.Events.AnyAsync(e => e.ProductId == req.ProductId);
+            if(!hasPreviousEvents)
+            {
+                var initialStock = await client.GetStock(req.ProductId);
+                var initialStockEvent = new Event
+                {
+                    ProductId = req.ProductId,
+                    IsRestock = true,
+                    Quantity = initialStock,
+                    Timestamp = DateTime.UtcNow
+                };
+                await context.Events.AddAsync(initialStockEvent);
+            }
+
+            var stockRestoredEvent = new Event
             {
               ProductId = req.ProductId,
-              Type = "restock",
+              IsRestock = true,
               Quantity = req.Amount,
               Timestamp = DateTime.UtcNow
             };
 
-            await context.Events.AddAsync(stockRestockEvent);
+            await context.Events.AddAsync(stockRestoredEvent);
             await context.SaveChangesAsync();
-            // await client.UpdateStock(req.ProductId, req.Amount + stock);
             return Results.Ok();
           })
         .WithName("Restock")
@@ -124,23 +148,26 @@ public static class CachedInventoryApiBuilder
       return app;
     }
 
-    private static async Task<int> GetStockFromEvents(EventStoreContext context, int productId)
+    private static async Task<ProductStock> GetStockFromEvents(EventStoreContext context, int productId)
     {
         var events = await GetEvents(context, productId);
-        var stock = 0;
+
+        var productStock = ProductStock.Default(productId);
 
         foreach (var e in events)
         {
-            if (e.Type == "retrieve")
+            IEvent @event;
+            if (e.IsRestock)
             {
-                stock -= e.Quantity;
+                @event = new StockRestored(e.ProductId, e.Quantity);
             }
-            else if (e.Type == "restock")
+            else
             {
-                stock += e.Quantity;
+                @event = new StockRemovalRequested(e.ProductId, e.Quantity, Guid.NewGuid());
             }
+            productStock = productStock.Apply(@event);
         }
-        return stock;
+        return productStock;
     }
 
   private static async Task<List<Event>> GetEvents(EventStoreContext context, int productId) => await context.Events
@@ -148,9 +175,31 @@ public static class CachedInventoryApiBuilder
     .OrderBy(e => e.Timestamp)
     .ToListAsync();
 
-
 }
+
+public interface IEvent;
+
+public record ProductStock(int ProductId, int Stock, Guid[] FailedRequests)
+{
+  public static ProductStock Default(int productId) => new(productId, 0, Array.Empty<Guid>());
+
+  public ProductStock Apply(IEvent @event) => @event switch
+  {
+    StockRestored e => this with { Stock = Stock + e.Amount },
+    StockRemovalRequested e =>
+      Stock >= e.Amount ?
+      this with { Stock = Stock - e.Amount }:
+      this with { FailedRequests = FailedRequests.Append(e.RequestId).ToArray() },
+    _ => this
+  };
+}
+
+public record StockRestored(int ProductId, int Amount) : IEvent;
+
+public record StockRemovalRequested(int ProductId, int Amount, Guid RequestId) : IEvent;
 
 public record RetrieveStockRequest(int ProductId, int Amount);
 
 public record RestockRequest(int ProductId, int Amount);
+
+
